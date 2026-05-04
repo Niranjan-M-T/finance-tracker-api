@@ -43,7 +43,8 @@ router.post('/push', async (req, res) => {
       transactions: { created: 0, updated: 0, errors: 0 },
       contacts: { created: 0, updated: 0, errors: 0 },
       classification_rules: { created: 0, updated: 0, errors: 0 },
-      categories: { created: 0, updated: 0, errors: 0 }
+      categories: { created: 0, updated: 0, errors: 0 },
+      splits: { created: 0, updated: 0, errors: 0 }
     };
 
     // ─── 1. SYNC CATEGORIES FIRST (so we can resolve names for transactions) ───
@@ -154,12 +155,17 @@ router.post('/push', async (req, res) => {
               $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, NOW()
             )
             ON CONFLICT (external_id) DO UPDATE SET
-              category_id = COALESCE(EXCLUDED.category_id, transactions.category_id),
-              subcategory_id = COALESCE(EXCLUDED.subcategory_id, transactions.subcategory_id),
-              is_classified = COALESCE(EXCLUDED.is_classified, transactions.is_classified),
-              classification_method = COALESCE(EXCLUDED.classification_method, transactions.classification_method),
+              -- CRITICAL: Only overwrite classification if incoming is classified
+              -- This prevents a fresh phone SMS scan from wiping existing classifications
+              category_id = CASE WHEN EXCLUDED.is_classified = true THEN COALESCE(EXCLUDED.category_id, transactions.category_id) ELSE transactions.category_id END,
+              subcategory_id = CASE WHEN EXCLUDED.is_classified = true THEN COALESCE(EXCLUDED.subcategory_id, transactions.subcategory_id) ELSE transactions.subcategory_id END,
+              is_classified = CASE WHEN EXCLUDED.is_classified = true THEN true ELSE transactions.is_classified END,
+              classification_method = CASE WHEN EXCLUDED.is_classified = true THEN COALESCE(EXCLUDED.classification_method, transactions.classification_method) ELSE transactions.classification_method END,
               merchant_name = COALESCE(EXCLUDED.merchant_name, transactions.merchant_name),
-              is_credit_card_repayment = COALESCE(EXCLUDED.is_credit_card_repayment, transactions.is_credit_card_repayment),
+              is_credit_card_repayment = CASE WHEN EXCLUDED.is_credit_card_repayment = true THEN true ELSE transactions.is_credit_card_repayment END,
+              is_split = CASE WHEN EXCLUDED.is_split = true THEN true ELSE transactions.is_split END,
+              is_loan = CASE WHEN EXCLUDED.is_loan = true THEN true ELSE transactions.is_loan END,
+              loan_type = COALESCE(EXCLUDED.loan_type, transactions.loan_type),
               notes = COALESCE(EXCLUDED.notes, transactions.notes),
               special_flag = COALESCE(EXCLUDED.special_flag, transactions.special_flag),
               special_flag_note = COALESCE(EXCLUDED.special_flag_note, transactions.special_flag_note),
@@ -247,11 +253,59 @@ router.post('/push', async (req, res) => {
       }
     }
 
+    // ─── 5. SYNC SPLITS ───
+    if (data.splits?.length > 0) {
+      for (const split of data.splits) {
+        try {
+          // Find the server transaction ID by external_id
+          let serverTxId = null;
+          if (split.transaction_external_id) {
+            const txResult = await query('SELECT id FROM transactions WHERE external_id = $1', [split.transaction_external_id]);
+            if (txResult.rows.length > 0) serverTxId = txResult.rows[0].id;
+          }
+          if (!serverTxId) {
+            results.splits.errors++;
+            continue;
+          }
+
+          // Upsert split
+          const splitResult = await query(`
+            INSERT INTO splits (transaction_id, total_amount, my_share, is_fully_settled, notes)
+            VALUES ($1, $2, $3, $4, $5)
+            ON CONFLICT (transaction_id) DO UPDATE SET
+              total_amount = EXCLUDED.total_amount,
+              my_share = EXCLUDED.my_share,
+              is_fully_settled = EXCLUDED.is_fully_settled,
+              notes = EXCLUDED.notes,
+              updated_at = NOW()
+            RETURNING id
+          `, [serverTxId, split.total_amount, split.my_share, split.is_fully_settled || false, split.notes]);
+
+          const serverSplitId = splitResult.rows[0].id;
+
+          // Upsert participants
+          if (split.participants?.length > 0) {
+            for (const p of split.participants) {
+              await query(`
+                INSERT INTO split_participants (split_id, contact_name, amount, is_settled, settled_at)
+                VALUES ($1, $2, $3, $4, $5)
+                ON CONFLICT DO NOTHING
+              `, [serverSplitId, p.contact_name, p.amount, p.is_settled || false, p.settled_at]);
+            }
+          }
+          results.splits.created++;
+        } catch (err) {
+          results.splits.errors++;
+          log.warn('sync_split_error', 'Failed to sync split', { error: err.message });
+        }
+      }
+    }
+
     // Log sync
     await query(`
       INSERT INTO sync_log (device_id, table_name, last_sync_at, records_synced, direction, status)
       VALUES ($1, 'all', NOW(), $2, 'push', 'success')
-    `, [device_id, (data.transactions?.length || 0) + (data.contacts?.length || 0) + (data.categories?.length || 0)]);
+    `, [device_id, (data.transactions?.length || 0) + (data.contacts?.length || 0) + (data.categories?.length || 0) + (data.splits?.length || 0)]);
 
     log.info('push_complete', 'Sync push completed', { device_id, results });
     res.json({ message: 'Sync complete', results });
@@ -316,18 +370,45 @@ router.post('/pull', async (req, res) => {
       [since]
     );
 
+    // Pull splits with participant data and transaction external_id
+    const splits = await query(`
+      SELECT s.*, t.external_id as transaction_external_id
+      FROM splits s
+      JOIN transactions t ON s.transaction_id = t.id
+      WHERE s.updated_at > $1
+      ORDER BY s.updated_at
+    `, [since]);
+
+    // Pull split participants for those splits
+    const splitIds = splits.rows.map(s => s.id);
+    let splitParticipants = { rows: [] };
+    if (splitIds.length > 0) {
+      const placeholders = splitIds.map((_, i) => `$${i + 1}`).join(',');
+      splitParticipants = await query(
+        `SELECT * FROM split_participants WHERE split_id IN (${placeholders})`,
+        splitIds
+      );
+    }
+
+    // Attach participants to their splits
+    const splitsWithParticipants = splits.rows.map(s => ({
+      ...s,
+      participants: splitParticipants.rows.filter(p => p.split_id === s.id)
+    }));
+
     // Log sync
     await query(`
       INSERT INTO sync_log (device_id, table_name, last_sync_at, records_synced, direction, status)
       VALUES ($1, 'all', NOW(), $2, 'pull', 'success')
-    `, [device_id, transactions.rowCount + categories.rowCount + contacts.rowCount]);
+    `, [device_id, transactions.rowCount + categories.rowCount + contacts.rowCount + splits.rowCount]);
 
     log.info('pull_complete', 'Sync pull completed', {
       device_id,
       transactions: transactions.rowCount,
       categories: categories.rowCount,
       contacts: contacts.rowCount,
-      rules: rules.rowCount
+      rules: rules.rowCount,
+      splits: splits.rowCount
     });
 
     res.json({
@@ -336,6 +417,7 @@ router.post('/pull', async (req, res) => {
       contacts: contacts.rows,
       classification_rules: rules.rows,
       accounts: accounts.rows,
+      splits: splitsWithParticipants,
       synced_at: new Date().toISOString()
     });
   } catch (err) {
