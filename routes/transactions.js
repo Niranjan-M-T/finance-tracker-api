@@ -199,6 +199,56 @@ router.put('/:id', async (req, res) => {
   }
 });
 
+// DELETE /api/transactions/:id - Delete transaction
+router.delete('/:id', async (req, res) => {
+  try {
+    // Delete split participants first (foreign key constraints)
+    await query('DELETE FROM split_participants WHERE split_id IN (SELECT id FROM splits WHERE transaction_id = $1)', [req.params.id]);
+    await query('DELETE FROM splits WHERE transaction_id = $1', [req.params.id]);
+    const result = await query('DELETE FROM transactions WHERE id = $1 RETURNING *', [req.params.id]);
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: 'Transaction not found' });
+    }
+    log.info('deleted', 'Transaction deleted', { id: req.params.id });
+    res.json({ success: true, transaction: result.rows[0] });
+  } catch (err) {
+    log.error('delete_error', 'Failed to delete transaction', { error: err.message, id: req.params.id });
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// POST /api/transactions/delete-bulk - Bulk delete transactions by ID or external_id
+router.post('/delete-bulk', async (req, res) => {
+  try {
+    const { ids, external_ids } = req.body;
+    if (!Array.isArray(ids) && !Array.isArray(external_ids)) {
+      return res.status(400).json({ error: 'ids or external_ids array required' });
+    }
+
+    let deletedCount = 0;
+    if (Array.isArray(ids) && ids.length > 0) {
+      // split participants
+      await query('DELETE FROM split_participants WHERE split_id IN (SELECT id FROM splits WHERE transaction_id = ANY($1))', [ids]);
+      await query('DELETE FROM splits WHERE transaction_id = ANY($1)', [ids]);
+      const resDel = await query('DELETE FROM transactions WHERE id = ANY($1) RETURNING id', [ids]);
+      deletedCount += resDel.rowCount;
+    }
+    if (Array.isArray(external_ids) && external_ids.length > 0) {
+      // split participants
+      await query('DELETE FROM split_participants WHERE split_id IN (SELECT id FROM splits WHERE transaction_id IN (SELECT id FROM transactions WHERE external_id = ANY($1)))', [external_ids]);
+      await query('DELETE FROM splits WHERE transaction_id IN (SELECT id FROM transactions WHERE external_id = ANY($1))', [external_ids]);
+      const resDel = await query('DELETE FROM transactions WHERE external_id = ANY($1) RETURNING id', [external_ids]);
+      deletedCount += resDel.rowCount;
+    }
+
+    log.info('bulk_deleted', 'Transactions bulk deleted', { count: deletedCount });
+    res.json({ success: true, count: deletedCount });
+  } catch (err) {
+    log.error('bulk_delete_error', 'Failed to bulk delete transactions', { error: err.message });
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
 // POST /api/transactions/bulk - Bulk create/upsert (for sync)
 router.post('/bulk', async (req, res) => {
   try {
